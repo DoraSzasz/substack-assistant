@@ -55,8 +55,39 @@ def _load(name: str):
 # ============================================================
 # RSS fetcher
 # ============================================================
+import urllib.request
+
 def fetch_articles(feed_url: str, limit: int = 30) -> list[dict]:
-    feed = feedparser.parse(feed_url)
+    # Substack blocks default bot user-agents — send a real browser UA
+    req = urllib.request.Request(
+        feed_url,
+        headers={
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                          "AppleWebKit/537.36 (KHTML, like Gecko) "
+                          "Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "application/rss+xml, application/xml, text/xml, */*",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            raw_xml = resp.read()
+    except Exception as e:
+        raise SystemExit(
+            f"❌ Couldn't fetch {feed_url}\n   {type(e).__name__}: {e}\n"
+            f"   Check the URL opens in your browser."
+        )
+
+    feed = feedparser.parse(raw_xml)
+    if not feed.entries:
+        raise SystemExit(
+            f"❌ Feed parsed but contained 0 entries.\n"
+            f"   Feed title: {feed.feed.get('title', '(none)')}\n"
+            f"   Possible causes:\n"
+            f"     • The publication has no public posts yet\n"
+            f"     • The feed URL is wrong (try opening it in your browser)\n"
+            f"     • Posts are all paid-subscriber-only (RSS only shows free posts)"
+        )
+
     articles = []
     for entry in feed.entries[:limit]:
         raw = entry.get("content", [{}])[0].get("value", entry.get("summary", ""))
