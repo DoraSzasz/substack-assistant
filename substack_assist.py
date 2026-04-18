@@ -55,10 +55,14 @@ def _load(name: str):
 # ============================================================
 # RSS fetcher
 # ============================================================
+import ssl
 import urllib.request
+import certifi
 
 def fetch_articles(feed_url: str, limit: int = 30) -> list[dict]:
-    # Substack blocks default bot user-agents — send a real browser UA
+    # Substack blocks default bot user-agents — send a real browser UA.
+    # Also use certifi's CA bundle so macOS + python.org installs work
+    # without needing the "Install Certificates.command" step.
     req = urllib.request.Request(
         feed_url,
         headers={
@@ -68,8 +72,9 @@ def fetch_articles(feed_url: str, limit: int = 30) -> list[dict]:
             "Accept": "application/rss+xml, application/xml, text/xml, */*",
         },
     )
+    ssl_ctx = ssl.create_default_context(cafile=certifi.where())
     try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
+        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
             raw_xml = resp.read()
     except Exception as e:
         raise SystemExit(
@@ -215,9 +220,19 @@ Return JSON: {"scores": [n, n, n], "notes": "..."}"""
 
 
 # ============================================================
-# AGENT 7: NOTE GENERATOR (archive → standalone notes)
+# AGENT 7: NOTE GENERATOR (archive → ONE standalone note)
 # ============================================================
-NOTE_GEN_SYSTEM = DRAFTER_SYSTEM  # same drafter prompt; different input
+NOTE_GEN_SYSTEM = """You are a Substack Note writer. Write ONE single Note
+that works as a standalone observation, then invites the reader to the full
+article. Strict rules:
+
+- Sound EXACTLY like the voice profile provided. Imitate sentence rhythm,
+  punctuation habits, and rhetorical moves.
+- The Note body: 40-80 words. Sharp, standalone, quotable.
+- End with the article URL on its own line.
+- Return ONLY valid JSON, no preamble, no markdown fences:
+  {"note": "<the note text including the URL on a new line>"}
+- Do NOT return an array. Do NOT return multiple drafts. ONE note only."""
 
 
 # ============================================================
@@ -283,16 +298,26 @@ def draft_note(topic: str) -> dict:
         f"VOICE PROFILE:\n{json.dumps(voice_profile)}\n\n"
         f"TOPIC: {topic}\n\n"
         f"OPTIONAL ARTICLE TO LINK (only if it truly fits):\n{json.dumps(related)}\n\n"
-        "Write a single 40-80 word Substack Note. Sharp, standalone observation. "
+        "Write ONE Substack Note (40-80 words). Sharp, standalone observation. "
         "If linking an article, put the URL on its own line at the end. "
-        "Sound EXACTLY like the voice profile. Return JSON: "
-        '{"drafts": ["..."]}'
+        "Sound EXACTLY like the voice profile. "
+        'Return ONLY JSON: {"note": "..."}'
     )
     resp = client.messages.create(
-        model=MODEL, max_tokens=1024, system=DRAFTER_SYSTEM,
+        model=MODEL, max_tokens=1024, system=NOTE_GEN_SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
-    return json.loads(_strip_fences(resp.content[0].text))
+    try:
+        raw = _strip_fences(resp.content[0].text)
+        parsed = json.loads(raw)
+        if "note" in parsed:
+            return {"drafts": [parsed["note"]]}
+        elif "drafts" in parsed:
+            return parsed
+        else:
+            return {"drafts": [raw]}
+    except json.JSONDecodeError:
+        return {"drafts": [resp.content[0].text]}
 
 
 def daily_notes(n: int = 5) -> list[dict]:
@@ -305,19 +330,31 @@ def daily_notes(n: int = 5) -> list[dict]:
         prompt = (
             f"VOICE PROFILE:\n{json.dumps(voice_profile)}\n\n"
             f"ARTICLE:\n{json.dumps(article)}\n\n"
-            "Write a 40-80 word Substack Note. A sharp standalone observation, "
-            "then the URL on its own line at the end. "
-            "Sound EXACTLY like the voice profile. Return JSON: "
-            '{"drafts": ["..."]}'
+            "Write ONE Substack Note (40-80 words) based on this article. "
+            "Sharp standalone observation, then the URL on its own line at the end. "
+            "Sound EXACTLY like the voice profile. "
+            'Return ONLY JSON: {"note": "..."}'
         )
-        resp = client.messages.create(
-            model=MODEL, max_tokens=512, system=DRAFTER_SYSTEM,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        note = json.loads(_strip_fences(resp.content[0].text))["drafts"][0]
+        try:
+            resp = client.messages.create(
+                model=MODEL, max_tokens=1024, system=NOTE_GEN_SYSTEM,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = _strip_fences(resp.content[0].text)
+            parsed = json.loads(raw)
+            # Handle both {"note": "..."} and legacy {"drafts": ["..."]}
+            if "note" in parsed:
+                note_text = parsed["note"]
+            elif "drafts" in parsed and parsed["drafts"]:
+                note_text = parsed["drafts"][0]
+            else:
+                note_text = raw  # last-resort fallback
+        except (json.JSONDecodeError, KeyError, IndexError) as e:
+            note_text = f"[⚠️  Could not parse draft for this article — {type(e).__name__}]"
+
         return {"article_title": article["title"],
                 "article_url": article["url"],
-                "note": note}
+                "note": note_text}
 
     with ThreadPoolExecutor(max_workers=len(picks)) as pool:
         return list(pool.map(_one, picks))
